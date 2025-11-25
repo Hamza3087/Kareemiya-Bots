@@ -34,6 +34,10 @@ from src import config
 # Import continuous transcription handler
 from src.continuous_transcription_handler import ContinuousTranscriptionHandler
 
+# Import ESL config reader for dynamic configuration
+from src.esl_config_reader import ESLConfigReader
+
+
 # Import Silero VAD singleton for speech detection
 from src.silero_vad_singleton import SileroVADSingleton
 
@@ -1322,9 +1326,10 @@ File Path: {file_path}
                     intent_detector=self.intent_detector,
                     logger=self.logger,
                     rnnt_confidence_threshold=self.agent_config.rnnt_confidence_threshold,
-                    energy_threshold=self.agent_config.energy_threshold  # From database
+                    energy_threshold=self.agent_config.energy_threshold,  # From database
+                    immediate_hangup_callback=self._perform_immediate_hangup_from_detection  # Emergency hangup via ESL
                 )
-                self._log_and_collect('info', f"Continuous transcription handler initialized (energy_threshold={self.agent_config.energy_threshold})")
+                self._log_and_collect('info', f"Continuous transcription handler initialized with immediate hangup (energy_threshold={self.agent_config.energy_threshold})")
 
                 # Register continuous transcription for cleanup (prevents memory leak)
                 self.resource_manager.register(
@@ -2302,6 +2307,82 @@ File Path: {file_path}
 
         # NOTE: Main thread will handle actual hangup in cleanup
         # Transcriptions collected in _finalize_call() (finally block)
+        
+        # NOTE: Main thread will handle actual hangup in cleanup
+        # Transcriptions collected in _finalize_call() (finally block)
+
+    def _perform_immediate_hangup_from_detection(self, disposition: str, intent_type: str):
+        """
+        Called from background detection thread when DNC/NI/HP detected.
+        Creates on-demand ESL inbound connection to interrupt playback immediately.
+        Falls back to existing flag-based mechanism if ESL fails.
+
+        Thread Safety: Runs in detection thread, uses separate ESL connection.
+
+        Args:
+            disposition: "DNC", "NI", or "HP"
+            intent_type: "do_not_call", "not_interested", or "hold_press"
+        """
+        # Step 1: ALWAYS set flags first (ensures fallback works)
+        self.call_data['disposition'] = disposition
+        self.call_data['intent_detected'] = intent_type
+        self.is_active = False
+
+        self._log_and_collect('warning',
+            f"🚫 IMMEDIATE HANGUP TRIGGERED: {disposition} ({intent_type})")
+
+        # Step 2: Attempt emergency ESL hangup (on-demand)
+        emergency_esl = None
+        try:
+            # Get ESL configuration dynamically
+            esl_config = ESLConfigReader.get_esl_config()
+
+            self._log_and_collect('debug',
+                f"Creating emergency ESL connection to {esl_config['host']}:{esl_config['port']}")
+
+            # Create ESL inbound connection (on-demand)
+            emergency_esl = ESL.ESLconnection(
+                esl_config['host'],
+                esl_config['port'],
+                esl_config['password']
+            )
+
+            if not emergency_esl.connected():
+                raise Exception("ESL connection failed (not connected)")
+
+            self._log_and_collect('info', "✓ Emergency ESL connected")
+
+            # Execute uuid_break to stop ALL audio immediately
+            break_result = emergency_esl.api("uuid_break", f"{self.uuid} all")
+            if break_result:
+                break_response = break_result.getBody()
+                self._log_and_collect('debug', f"uuid_break response: {break_response}")
+
+            # Small delay for break to propagate
+            time.sleep(0.01)  # 10ms
+
+            # Execute uuid_kill to terminate channel
+            kill_result = emergency_esl.api("uuid_kill", f"{self.uuid}")
+            if kill_result:
+                kill_response = kill_result.getBody()
+                self._log_and_collect('debug', f"uuid_kill response: {kill_response}")
+
+            self._log_and_collect('warning',
+                f"✓ Emergency hangup executed: {disposition} (uuid_break + uuid_kill)")
+
+        except Exception as e:
+            self._log_and_collect('error',
+                f"Emergency ESL hangup failed: {e} - falling back to flag-based hangup")
+            # Fallback: Flags already set above, main thread will detect and handle
+
+        finally:
+            # Always clean up ESL connection
+            if emergency_esl:
+                try:
+                    emergency_esl.disconnect()
+                    self._log_and_collect('debug', "Emergency ESL disconnected")
+                except Exception as e:
+                    self._log_and_collect('debug', f"ESL disconnect error: {e}")
 
     def _execute_call_flow(self):
         """

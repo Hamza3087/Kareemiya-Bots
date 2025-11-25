@@ -26,7 +26,7 @@ class ContinuousTranscriptionHandler:
     Detects DNC/NI intents in real-time without interrupting playback.
     """
 
-    def __init__(self, parakeet_model, intent_detector, logger, rnnt_confidence_threshold=0.3, energy_threshold=0.045):
+    def __init__(self, parakeet_model, intent_detector, logger, rnnt_confidence_threshold=0.3, energy_threshold=0.045, immediate_hangup_callback=None):
         """
         Initialize continuous transcription handler
 
@@ -36,12 +36,15 @@ class ContinuousTranscriptionHandler:
             logger: Logger instance
             rnnt_confidence_threshold: Minimum confidence for transcriptions
             energy_threshold: Silero VAD threshold from database (e_campaign.energy_threshold)
+            immediate_hangup_callback: Optional callback function for immediate hangup on DNC/NI/HP detection
+                                      Signature: callback(disposition: str, intent_type: str)
         """
         self.parakeet_model = parakeet_model
         self.intent_detector = intent_detector
         self.logger = logger
         self.rnnt_confidence_threshold = rnnt_confidence_threshold
         self.energy_threshold = energy_threshold
+        self.immediate_hangup_callback = immediate_hangup_callback
 
         # Get Silero VAD singleton reference (preloaded by bot_server at startup)
         # Store threshold for use in inference calls
@@ -469,25 +472,38 @@ class ContinuousTranscriptionHandler:
                 intent_type, intent_confidence = intent_result
                 self.logger.warning(f"🚫 INTENT DETECTED (continuous): {intent_type} - '{text}' (conf: {intent_confidence:.2f})")
 
-                # Set appropriate flags
+                # Set appropriate flags and determine disposition
+                disposition = None
                 with self.detection_lock:
                     if intent_type == "do_not_call":
                         self.dnc_detected = True
                         self.stats['dnc_detections'] += 1
                         self.logger.warning(f"🚫 DNC DETECTED during playback!")
+                        disposition = "DNC"
                     elif intent_type == "not_interested":
                         self.ni_detected = True
                         self.stats['ni_detections'] += 1
                         self.logger.warning(f"⚠️ NI DETECTED during playback!")
+                        disposition = "NI"
                     elif intent_type == "hold_press":
                         self.hp_detected = True
                         self.stats['hp_detections'] += 1
                         self.logger.warning(f"🍯 HP (Hold/Press) DETECTED during playback!")
+                        disposition = "HP"
                     elif intent_type == "obscenity":
                         # Treat obscenity as DNC
                         self.dnc_detected = True
                         self.stats['dnc_detections'] += 1
                         self.logger.warning(f"🚫 OBSCENITY DETECTED during playback (treated as DNC)!")
+                        disposition = "DNC"
+
+                # Trigger immediate hangup callback if configured
+                if disposition and self.immediate_hangup_callback:
+                    try:
+                        self.immediate_hangup_callback(disposition, intent_type)
+                    except Exception as e:
+                        self.logger.error(f"Immediate hangup callback failed: {e}", exc_info=True)
+                        # Continue - flags are already set, main thread will handle fallback
 
         except Exception as e:
             self.logger.error(f"Error checking intents: {e}", exc_info=True)
