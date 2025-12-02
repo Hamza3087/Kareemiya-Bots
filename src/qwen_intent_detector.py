@@ -377,8 +377,8 @@ CATEGORIES:
 13. I already received compensation / I was already paid
 14. Are you a lawyer / is this a law firm?
 15. This sounds like a scam / I don't trust this
-16. Positive/Yes/Agreement
-17. Negative/No/Disagreement
+16. Agreement to the question / explicit Yes
+17. Negative/No/Disagreement 
 18. Other question not listed above
 
 USER INPUT: "{answer}"

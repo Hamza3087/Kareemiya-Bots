@@ -59,6 +59,9 @@ except ImportError:
 # Import FreeSWITCH transfer manager
 from src.freeswitch_transfer_manager import FreeSWITCHTransferManager
 
+# Import chunked playback controller for pause/resume support
+from src.chunked_playback import ChunkedPlaybackController, ChunkedPlaybackResult
+
 # Configuration
 SUITECRM_UPLOAD_DIR = "/var/www/recordings"
 
@@ -321,6 +324,13 @@ class FreeSWITCHBotHandler:
         self.is_playing_audio = False
         self.playback_start_time = None
         self.playback_periods = []  # Track (start_time, end_time) tuples for race condition fix
+
+        # Chunked playback controller for pause/resume support
+        # Initialized lazily on first use (after continuous_transcription is set up)
+        self.chunked_playback_controller: Optional[ChunkedPlaybackController] = None
+
+        # Current step context for pause intent routing
+        self._current_step_for_pause: Optional[Dict] = None
 
         # Main response listening flag (continuous transcription runs when this is False)
         self.main_response_listening = False
@@ -1504,6 +1514,344 @@ File Path: {file_path}
                 self.continuous_transcription.mark_playback_end()
             return False
 
+    def _get_chunked_playback_controller(self) -> ChunkedPlaybackController:
+        """
+        Get or create the chunked playback controller.
+        Lazy initialization to ensure continuous_transcription is ready.
+
+        Auto pause/resume behavior:
+        - When user speaks during playback, pause at next chunk boundary
+        - After 5 seconds of silence, automatically resume playback
+        """
+        if self.chunked_playback_controller is None:
+            self.chunked_playback_controller = ChunkedPlaybackController(
+                conn=self.conn,
+                uuid=self.uuid,
+                continuous_transcription=self.continuous_transcription,
+                logger=self.logger,
+                chunk_duration_ms=500,  # 500ms chunks = max pause latency
+                on_chunk_complete=self._on_chunk_complete,
+                auto_resume_on_silence=True,  # Enable auto-resume after user stops speaking
+                silence_threshold=5.0,  # Legacy: keep for backward compat
+                pause_silence_threshold=config.RESPONSE_SILENCE_TIMEOUT,  # 0.7s silence to trigger intent check
+                on_pause_intent_check=self._check_pause_intent  # Intent check callback during pause
+            )
+        return self.chunked_playback_controller
+
+    def _on_chunk_complete(self, chunk_index: int, total_chunks: int):
+        """Callback after each chunk completes playback"""
+        # Optional: Log progress for debugging
+        if chunk_index % 10 == 0:  # Log every 10 chunks (~5 seconds)
+            self._log_and_collect('debug', f"[CHUNKED] Progress: chunk {chunk_index + 1}/{total_chunks}")
+
+    def _check_pause_intent(self, transcription: str) -> tuple:
+        """
+        Check intent from transcription captured during playback pause.
+        NOTE: Transcription is ALREADY done by CT during playback - no re-transcription needed!
+
+        Args:
+            transcription: Already-transcribed text from CT handler
+
+        Returns:
+            Tuple of (intent_type, transcription_text)
+            intent_type: 'neutral', 'positive', 'negative', 'clarifying',
+                         'do_not_call', 'not_interested', 'hold_press', or None
+        """
+        if not transcription or len(transcription.strip()) == 0:
+            self._log_and_collect('debug', "[PAUSE INTENT] Empty transcription - treating as neutral")
+            return "neutral", None
+
+        text = transcription.strip()
+        self._log_and_collect('info', f"[PAUSE INTENT] Checking intent for: '{text}'")
+
+        # Pre-screen with keyword detector for DNC/NI/HP
+        keyword_result = self.intent_detector.detect_intent(text)
+        if keyword_result:
+            intent, kw_confidence = keyword_result
+            if intent in ["do_not_call", "not_interested", "hold_press"]:
+                self._log_and_collect('info', f"[PAUSE INTENT] Keyword detected: {intent}")
+                return intent, text
+
+        # Use Qwen for nuanced classification
+        if hasattr(self, 'qwen_detector') and self.qwen_detector and hasattr(self, '_current_step_for_pause'):
+            try:
+                question = self._extract_question_from_step(self._current_step_for_pause)
+                qwen_result = self.qwen_detector.detect_intent(question, text, timeout=config.QWEN_TOTAL_TIMEOUT)
+
+                if qwen_result:
+                    self._log_and_collect('info', f"[PAUSE INTENT] Qwen classified: {qwen_result}")
+                    # Return as-is - rebuttals have their own routing in call flow
+                    return qwen_result, text
+            except Exception as e:
+                self._log_and_collect('warning', f"[PAUSE INTENT] Qwen failed: {e}")
+
+        # Default to neutral if no clear intent
+        return "neutral", text
+
+    def _play_audio_chunked(self, audio_file: str, step: Optional[Dict] = None) -> bool:
+        """
+        Play audio file using chunked playback with pause/resume support.
+
+        This method splits audio into small chunks (500ms) and plays them
+        sequentially, allowing for pause/resume at chunk boundaries.
+
+        Args:
+            audio_file: Audio file name
+            step: Optional step dictionary with greetings/us_states flags
+
+        Returns:
+            True if playback succeeded/completed, False if interrupted or failed
+        """
+        try:
+            # Get full path to audio file
+            audio_path = get_audio_path_for_agent(
+                audio_file,
+                self.agent_config.voice_location,
+                greetings=False,
+                us_states=False
+            )
+
+            if not audio_path or not os.path.exists(audio_path):
+                self._log_and_collect('error', f"Audio file not found: {audio_path}")
+                return False
+
+            # Check if channel still exists (caller hasn't hung up)
+            if not self._is_channel_active():
+                self._handle_premature_hangup()
+                return False
+
+            # Check if call is still active before playing
+            if not self.is_active:
+                self._log_and_collect('warning', "Call not active - skipping playback")
+                return False
+
+            self._log_and_collect('info', f"Playing (chunked): {os.path.basename(audio_path)}")
+            self.conversation_log.append(f"Bot: {os.path.basename(audio_path)}")
+
+            # Mark playback start for continuous transcription
+            self.is_playing_audio = True
+            self.playback_start_time = time.time()
+            if self.continuous_transcription:
+                self.continuous_transcription.mark_playback_start()
+
+            # Get or create chunked playback controller
+            controller = self._get_chunked_playback_controller()
+
+            # Play audio using chunked playback
+            result = controller.play_audio(audio_path)
+
+            # Mark playback end
+            self.is_playing_audio = False
+            if self.continuous_transcription:
+                self.continuous_transcription.mark_playback_end()
+
+            # Handle result
+            if result == ChunkedPlaybackResult.COMPLETED:
+                self._log_and_collect('debug', "Chunked playback completed")
+
+            elif result == ChunkedPlaybackResult.INTERRUPTED:
+                self._log_and_collect('info', f"Chunked playback interrupted (barge-in) at {controller.progress_percent:.1f}%")
+                # Barge-in detected - check for DNC/NI/HP
+                return self._handle_playback_interrupt()
+
+            elif result == ChunkedPlaybackResult.PAUSED:
+                self._log_and_collect('info', f"Chunked playback paused at {controller.progress_percent:.1f}%")
+                # External pause requested - return True to continue call flow
+                return True
+
+            elif result == ChunkedPlaybackResult.CHANNEL_GONE:
+                self._log_and_collect('warning', "Channel gone during chunked playback")
+                self._handle_premature_hangup()
+                return False
+
+            elif result == ChunkedPlaybackResult.FAILED:
+                self._log_and_collect('error', "Chunked playback failed")
+                return False
+
+            elif result == ChunkedPlaybackResult.INTENT_DETECTED:
+                intent = controller.detected_intent
+                transcription = controller.detected_transcription
+                self._log_and_collect('info', f"Playback interrupted by intent: {intent} ('{transcription}')")
+
+                # Handle based on intent type
+                if intent == "do_not_call":
+                    self._handle_dnc()
+                    return False
+                elif intent == "not_interested":
+                    self._handle_not_interested()
+                    return False
+                elif intent == "hold_press":
+                    self._handle_honeypot()
+                    return False
+                else:
+                    # Route to appropriate call flow step and signal to exit current step
+                    self._handle_pause_intent_routing(intent, transcription)
+                    return "ROUTED"  # Signal: step changed, exit immediately
+
+            # Check for DNC/NI/HP AFTER playback completes (same as _play_audio)
+            if self.continuous_transcription:
+                detected, intent_type = self.continuous_transcription.has_dnc_ni_detection()
+                if detected:
+                    self._log_and_collect('warning', f"[BLOCKED] {intent_type} detected after chunked playback - ending call")
+                    return self._handle_intent_detection(intent_type)
+
+            return True
+
+        except Exception as e:
+            self._log_and_collect('error', f"Chunked playback error: {e}", exc_info=True)
+            # Clean up playback state
+            self.is_playing_audio = False
+            if self.continuous_transcription:
+                self.continuous_transcription.mark_playback_end()
+            return False
+
+    def _handle_playback_interrupt(self) -> bool:
+        """
+        Handle playback interruption (barge-in detected).
+
+        Returns:
+            False to signal call should handle the interruption
+        """
+        if self.continuous_transcription:
+            detected, intent_type = self.continuous_transcription.has_dnc_ni_detection()
+            if detected:
+                self._log_and_collect('warning', f"[BLOCKED] {intent_type} detected during barge-in")
+                return self._handle_intent_detection(intent_type)
+
+        # Barge-in but no negative intent - could be a question or positive response
+        self._log_and_collect('info', "Barge-in detected but no negative intent")
+        return False  # Signal to handle the response
+
+    def _handle_intent_detection(self, intent_type: str) -> bool:
+        """
+        Handle detected intent (DNC/NI/HP) during or after playback.
+
+        Args:
+            intent_type: Type of intent detected ("DNC", "NI", "HP")
+
+        Returns:
+            False to signal call should end
+        """
+        intent_map = {
+            "DNC": ("DNC", "do_not_call", "dnc_during_playback"),
+            "NI": ("NI", "not_interested", "ni_during_playback"),
+            "HP": ("HP", "hold_press", "hp_during_playback")
+        }
+
+        if intent_type in intent_map:
+            disposition, intent_detected, call_result = intent_map[intent_type]
+            # Only set if disposition not already set (preserve earlier detections)
+            if self.call_data['disposition'] == 'INITIATED':
+                self.call_data['disposition'] = disposition
+                self.call_data['intent_detected'] = intent_detected
+                self.call_data['call_result'] = call_result
+                self._log_and_collect('info', f"Setting disposition: {disposition} (detected during playback)")
+            else:
+                self._log_and_collect('info', f"{intent_type} detected but preserving disposition: {self.call_data['disposition']}")
+            self.is_active = False
+
+        return False
+
+    def _handle_pause_intent_routing(self, intent: str, transcription: str) -> bool:
+        """
+        Route to appropriate call flow step based on intent detected during pause.
+
+        Args:
+            intent: The detected intent (positive, negative, clarifying, rebuttal_question_*, etc.)
+            transcription: The user's transcribed speech
+
+        Returns:
+            True to continue call flow, False to end
+        """
+        if not hasattr(self, '_current_step_for_pause') or not self._current_step_for_pause:
+            self._log_and_collect('warning', "[PAUSE ROUTING] No current step context - continuing")
+            return True
+
+        step = self._current_step_for_pause
+        if transcription:
+            self.conversation_log.append(f"User (during playback): {transcription}")
+
+        # Use existing intent-to-step mapping
+        next_step = self._map_qwen_intent_to_step(step, intent)
+
+        if next_step:
+            self._log_and_collect('info', f"[PAUSE ROUTING] Routing {intent} -> {next_step}")
+            self.current_step = next_step
+            return True
+        else:
+            # No explicit route - use no_match_next or continue
+            no_match = step.get('no_match_next')
+            if no_match:
+                self._log_and_collect('info', f"[PAUSE ROUTING] No match for {intent} -> using no_match_next: {no_match}")
+                self.current_step = no_match
+            else:
+                self._log_and_collect('info', f"[PAUSE ROUTING] No match for {intent} and no no_match_next - continuing with current flow")
+            return True
+
+    def pause_playback(self):
+        """
+        Request pause of chunked playback at next chunk boundary.
+        Non-blocking - playback will pause after current chunk finishes.
+        """
+        if self.chunked_playback_controller and self.chunked_playback_controller.is_playing:
+            self.chunked_playback_controller.pause()
+            self._log_and_collect('info', "Pause requested for chunked playback")
+
+    def resume_playback(self) -> bool:
+        """
+        Resume chunked playback from where it was paused.
+
+        Returns:
+            True if resumed successfully, False otherwise
+        """
+        if self.chunked_playback_controller and self.chunked_playback_controller.is_paused:
+            self._log_and_collect('info', "Resuming chunked playback")
+
+            # Mark playback start again
+            self.is_playing_audio = True
+            self.playback_start_time = time.time()
+            if self.continuous_transcription:
+                self.continuous_transcription.mark_playback_start()
+
+            result = self.chunked_playback_controller.resume()
+
+            # Mark playback end
+            self.is_playing_audio = False
+            if self.continuous_transcription:
+                self.continuous_transcription.mark_playback_end()
+
+            return result == ChunkedPlaybackResult.COMPLETED
+
+        self._log_and_collect('warning', "No paused playback to resume")
+        return False
+
+    def get_playback_progress(self) -> dict:
+        """
+        Get current playback progress information.
+
+        Returns:
+            Dict with progress info (percent, position_ms, total_ms, etc.)
+        """
+        if self.chunked_playback_controller:
+            return {
+                'is_playing': self.chunked_playback_controller.is_playing,
+                'is_paused': self.chunked_playback_controller.is_paused,
+                'progress_percent': self.chunked_playback_controller.progress_percent,
+                'position_ms': self.chunked_playback_controller.current_position_ms,
+                'total_ms': self.chunked_playback_controller.total_duration_ms,
+                'current_chunk': self.chunked_playback_controller.paused_chunk_index,
+                'total_chunks': self.chunked_playback_controller.total_chunks
+            }
+        return {
+            'is_playing': self.is_playing_audio,
+            'is_paused': False,
+            'progress_percent': 0,
+            'position_ms': 0,
+            'total_ms': 0,
+            'current_chunk': 0,
+            'total_chunks': 0
+        }
+
     def _listen_for_response(self, timeout: int = 10, step: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """
         Record and transcribe user response using Silero VAD with three-timeout system
@@ -2462,9 +2810,16 @@ File Path: {file_path}
             else:
                 self._log_and_collect('info', f"Step specifies {step['disposition']} but preserving: {self.call_data['disposition']}")
 
-        # Play audio if specified
+        # Play audio if specified (using chunked playback for pause/resume on speech)
         if 'audio_file' in step:
-            if not self._play_audio(step['audio_file'], step):
+            # Store step context for pause intent routing
+            self._current_step_for_pause = step
+            playback_result = self._play_audio_chunked(step['audio_file'], step)
+            if playback_result == "ROUTED":
+                # Step changed during playback - exit to let main loop process new step
+                self._log_and_collect('debug', f"[PROCESS_STEP] Playback routed to new step: {self.current_step}")
+                return True
+            elif not playback_result:
                 if self.call_data['disposition'] == 'INITIATED':
                     self.call_data['disposition'] = 'NP'
                 return False

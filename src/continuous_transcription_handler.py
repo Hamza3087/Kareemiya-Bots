@@ -99,6 +99,14 @@ class ContinuousTranscriptionHandler:
             'vad_silence_segments': 0
         }
 
+        # Speech event callbacks for pause/resume functionality
+        self.on_speech_start_callback: Optional[Callable[[], None]] = None
+        self.on_speech_end_callback: Optional[Callable[[], None]] = None
+        self.speech_end_silence_threshold = 5.0  # 5 seconds of silence before triggering speech_end
+        self._speech_end_callback_fired = False  # Prevent duplicate callbacks
+        self._speech_callbacks_lock = threading.Lock()
+        self._speech_end_silence_start = None  # Dedicated timer for speech_end callback (independent of transcription dedup)
+
         self.logger.info("ContinuousTranscriptionHandler initialized with Silero VAD")
 
     def mark_playback_start(self):
@@ -141,6 +149,37 @@ class ContinuousTranscriptionHandler:
                         return True
 
             return False
+
+    def set_speech_callbacks(
+        self,
+        on_start: Optional[Callable[[], None]] = None,
+        on_end: Optional[Callable[[], None]] = None,
+        silence_threshold: float = 5.0
+    ):
+        """
+        Set callbacks for speech start/end events.
+        Used by ChunkedPlaybackController for auto pause/resume.
+
+        Args:
+            on_start: Callback when speech starts (user starts talking)
+            on_end: Callback when speech ends (after silence_threshold seconds of silence)
+            silence_threshold: Seconds of silence before triggering on_end callback
+        """
+        with self._speech_callbacks_lock:
+            self.on_speech_start_callback = on_start
+            self.on_speech_end_callback = on_end
+            self.speech_end_silence_threshold = silence_threshold
+            self._speech_end_callback_fired = False
+            self.logger.info(f"Speech callbacks configured (silence_threshold={silence_threshold}s)")
+
+    def clear_speech_callbacks(self):
+        """Clear speech event callbacks"""
+        with self._speech_callbacks_lock:
+            self.on_speech_start_callback = None
+            self.on_speech_end_callback = None
+            self._speech_end_callback_fired = False
+            self._speech_end_silence_start = None  # Clear dedicated callback timer
+            self.logger.debug("Speech callbacks cleared")
 
     def add_audio_chunk(self, audio_bytes: bytes):
         """
@@ -204,6 +243,26 @@ class ContinuousTranscriptionHandler:
 
             # Return copy of buffer (last 2-3 seconds)
             return bytes(self.audio_buffer)
+
+    def transcribe_audio_direct(self, audio_bytes: bytes) -> tuple:
+        """
+        Transcribe audio bytes directly without buffering.
+        Used for pause intent detection.
+
+        Args:
+            audio_bytes: Raw audio bytes (8kHz, 16-bit mono)
+
+        Returns:
+            Tuple of (transcription_text, confidence)
+        """
+        if len(audio_bytes) < 1600:  # Less than 100ms
+            return None, 0.0
+
+        try:
+            return self._transcribe_audio_chunk(audio_bytes)
+        except Exception as e:
+            self.logger.error(f"Direct transcription failed: {e}")
+            return None, 0.0
 
     def transcribe_and_check_intents(self):
         """
@@ -318,6 +377,8 @@ class ContinuousTranscriptionHandler:
             )
 
             current_time = time.time()
+            speech_start_callback = None
+            speech_end_callback = None
 
             with self.speech_lock:
                 if is_speech:
@@ -327,8 +388,16 @@ class ContinuousTranscriptionHandler:
                         self.is_speaking = True
                         self.speech_start_time = current_time
                         self.silence_start_time = None
+                        self._speech_end_silence_start = None  # Reset dedicated callback timer
                         self.stats['vad_speech_segments'] += 1
-                        self.logger.debug("🗣️ Speech started")
+                        self.logger.debug("Speech started")
+
+                        # Capture callback to fire outside lock
+                        with self._speech_callbacks_lock:
+                            if self.on_speech_start_callback:
+                                speech_start_callback = self.on_speech_start_callback
+                            # Reset speech_end fired flag when new speech starts
+                            self._speech_end_callback_fired = False
                 else:
                     # Silence detected
                     if self.is_speaking:
@@ -340,12 +409,41 @@ class ContinuousTranscriptionHandler:
                                 # Valid speech segment ended, start silence timer
                                 self.is_speaking = False
                                 self.silence_start_time = current_time
+                                self._speech_end_silence_start = current_time  # Start dedicated callback timer
                                 self.stats['vad_silence_segments'] += 1
-                                self.logger.debug(f"🤐 Speech ended (duration: {speech_duration:.2f}s), silence started")
+                                self.logger.debug(f"Speech ended (duration: {speech_duration:.2f}s), silence started")
                             else:
                                 # Speech too short, might be noise
                                 self.is_speaking = False
                                 self.speech_start_time = None
+
+                    # Check if we've reached silence threshold for speech_end callback
+                    # Use dedicated timer that isn't reset by transcription dedup logic
+                    if self._speech_end_silence_start:
+                        silence_duration = current_time - self._speech_end_silence_start
+                        with self._speech_callbacks_lock:
+                            if (silence_duration >= self.speech_end_silence_threshold and
+                                self.on_speech_end_callback and
+                                not self._speech_end_callback_fired):
+                                speech_end_callback = self.on_speech_end_callback
+                                self._speech_end_callback_fired = True
+                                self._speech_end_silence_start = None  # Clear after firing
+                                self.logger.debug(f"Silence threshold reached ({silence_duration:.1f}s >= {self.speech_end_silence_threshold}s)")
+
+            # Fire callbacks outside of locks to prevent deadlocks
+            if speech_start_callback:
+                try:
+                    self.logger.info("[SPEECH CALLBACK] Triggering on_speech_start")
+                    speech_start_callback()
+                except Exception as e:
+                    self.logger.error(f"Error in speech_start callback: {e}")
+
+            if speech_end_callback:
+                try:
+                    self.logger.info("[SPEECH CALLBACK] Triggering on_speech_end (silence threshold reached)")
+                    speech_end_callback()
+                except Exception as e:
+                    self.logger.error(f"Error in speech_end callback: {e}")
 
         except Exception as e:
             self.logger.error(f"Error updating speech state: {e}", exc_info=True)
