@@ -7,7 +7,7 @@ Audio is chunked in memory at playback time - NO files are created or modified.
 
 Key Features:
 - On-demand chunking in RAM (no disk writes)
-- Pause at any chunk boundary (every 500ms by default)
+- Pause at any chunk boundary (every 1000ms by default)
 - Resume from exact paused position
 - Uses FreeSWITCH file_string for in-memory playback
 - Thread-safe design for concurrent barge-in detection
@@ -27,9 +27,27 @@ import threading
 import time
 import tempfile
 import logging
+import errno
 from enum import Enum
 from typing import Optional, List, Callable, Tuple
 from dataclasses import dataclass
+from functools import wraps
+
+# Retry configuration - minimal delays for voice call responsiveness
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_DELAY = 0.02   # 20ms base delay
+EBADF_RETRY_DELAY = 0.05     # 50ms for fd errors (need slightly more recovery time)
+
+
+def is_retriable_error(exception: Exception) -> bool:
+    """
+    Always returns True - retry ALL errors for voice call robustness.
+
+    Voice calls are time-critical and transient issues are common.
+    It's better to retry and potentially succeed than to fail the call.
+    """
+    return True
+
 
 # Import ESL for FreeSWITCH interaction
 try:
@@ -75,7 +93,7 @@ class ChunkedPlaybackController:
     """
 
     # Configuration
-    DEFAULT_CHUNK_DURATION_MS = 500  # 500ms chunks = pause granularity
+    DEFAULT_CHUNK_DURATION_MS = 1000  # 1000ms chunks = pause granularity
     SAMPLE_RATE = 8000               # FreeSWITCH default (8kHz)
 
     def __init__(
@@ -248,132 +266,404 @@ class ChunkedPlaybackController:
         except Exception as e:
             self.logger.error(f"[CHUNKED] Auto-resume error: {e}", exc_info=True)
 
-    def _is_channel_active(self) -> bool:
-        """Check if the FreeSWITCH channel is still active"""
-        try:
-            result = self.conn.api("uuid_exists", self.uuid)
-            if result:
-                return result.getBody().strip().lower() == "true"
-        except Exception as e:
-            self.logger.error(f"[CHUNKED] Error checking channel status: {e}")
+    def _is_channel_active(self, max_retries: int = DEFAULT_MAX_RETRIES) -> bool:
+        """
+        Check if the FreeSWITCH channel is still active - retries on ALL errors.
+
+        Args:
+            max_retries: Maximum retry attempts
+
+        Returns:
+            True if channel is active, False otherwise
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                result = self.conn.api("uuid_exists", self.uuid)
+                if result:
+                    body = result.getBody()
+                    if body:
+                        return body.strip().lower() == "true"
+                    # Empty body - retry
+                    if attempt < max_retries:
+                        self.logger.debug(f"[CHUNKED] uuid_exists returned empty body, retrying...")
+                        time.sleep(DEFAULT_RETRY_DELAY)
+                        continue
+                return False
+
+            except Exception as e:
+                # Retry ALL errors
+                if attempt < max_retries:
+                    self.logger.warning(
+                        f"[CHUNKED] _is_channel_active failed (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying..."
+                    )
+                    time.sleep(EBADF_RETRY_DELAY)
+                else:
+                    self.logger.error(
+                        f"[CHUNKED] _is_channel_active failed after {max_retries + 1} attempts: {e}"
+                    )
+                    # On repeated failures, assume channel is gone (safer)
+                    return False
+
         return False
 
-    def _load_and_chunk_audio(self, audio_path: str) -> bool:
+    def _execute_sleep_with_retry(self, duration_ms: int, max_retries: int = DEFAULT_MAX_RETRIES) -> bool:
         """
-        Load audio file (any format) and split into chunks in memory.
+        Execute FreeSWITCH sleep command - retries on ALL errors.
+        Falls back to Python time.sleep() if FreeSWITCH fails.
+
+        Args:
+            duration_ms: Sleep duration in milliseconds
+            max_retries: Maximum retry attempts
+
+        Returns:
+            True if succeeded (either FS or fallback), False on definitive channel gone
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                result = self.conn.execute("sleep", str(duration_ms))
+
+                if result:
+                    reply = result.getHeader("Reply-Text") or ""
+                    if "-ERR" in reply:
+                        # Definitive channel gone - don't retry
+                        if "no such channel" in reply.lower() or "invalid session" in reply.lower():
+                            self.logger.warning(f"[CHUNKED] Sleep failed - channel gone: {reply}")
+                            return False
+                        # All other errors - retry
+                        if attempt < max_retries:
+                            self.logger.warning(
+                                f"[CHUNKED] sleep failed (attempt {attempt + 1}/{max_retries + 1}): {reply}. Retrying..."
+                            )
+                            time.sleep(duration_ms / 1000.0)  # Use Python sleep as backup
+                            continue
+
+                return True
+
+            except Exception as e:
+                # Retry ALL exceptions with Python sleep as fallback
+                if attempt < max_retries:
+                    self.logger.warning(
+                        f"[CHUNKED] sleep exception (attempt {attempt + 1}/{max_retries + 1}): {e}. Using Python fallback..."
+                    )
+                    time.sleep(duration_ms / 1000.0)
+                else:
+                    self.logger.warning(
+                        f"[CHUNKED] sleep failed after {max_retries + 1} attempts, using Python fallback: {e}"
+                    )
+                    time.sleep(duration_ms / 1000.0)
+                    return True  # Success via fallback
+
+        return True
+
+    def _play_chunk_with_retry(self, temp_path: str, chunk_index: int, total_chunks: int,
+                                max_retries: int = DEFAULT_MAX_RETRIES) -> Tuple[bool, Optional[str]]:
+        """
+        Play a single chunk with retry logic - retries on ALL errors.
+
+        Args:
+            temp_path: Path to temporary WAV file
+            chunk_index: Current chunk index (for logging)
+            total_chunks: Total number of chunks (for logging)
+            max_retries: Maximum retry attempts
+
+        Returns:
+            Tuple of (success: bool, error_type: Optional[str])
+            error_type can be: None (success), "channel_gone", "failed"
+        """
+        for attempt in range(max_retries + 1):
+            try:
+                self.logger.debug(
+                    f"[CHUNKED] Playing chunk {chunk_index + 1}/{total_chunks}" +
+                    (f" (retry {attempt})" if attempt > 0 else "")
+                )
+
+                result = self.conn.execute("playback", temp_path)
+
+                # Check playback result for errors
+                if result:
+                    reply = result.getHeader("Reply-Text") or ""
+                    if "-ERR" in reply:
+                        reply_lower = reply.lower()
+                        # Check for definitive channel gone (don't retry these)
+                        if 'no such channel' in reply_lower or 'invalid session' in reply_lower:
+                            return False, "channel_gone"
+                        # Retry ALL other errors
+                        if attempt < max_retries:
+                            self.logger.warning(
+                                f"[CHUNKED] Playback failed (attempt {attempt + 1}/{max_retries + 1}): {reply}. Retrying..."
+                            )
+                            time.sleep(EBADF_RETRY_DELAY)
+                            continue
+                        # Max retries reached - check channel and fail
+                        if not self._is_channel_active():
+                            return False, "channel_gone"
+                        self.logger.error(f"[CHUNKED] Playback failed after {max_retries + 1} attempts: {reply}")
+                        return False, "failed"
+
+                if attempt > 0:
+                    self.logger.info(f"[CHUNKED] Playback succeeded on retry {attempt}")
+
+                return True, None
+
+            except Exception as e:
+                # Retry ALL exceptions
+                if attempt < max_retries:
+                    self.logger.warning(
+                        f"[CHUNKED] Playback exception (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying..."
+                    )
+                    time.sleep(EBADF_RETRY_DELAY)
+                else:
+                    self.logger.error(
+                        f"[CHUNKED] Playback failed after {max_retries + 1} attempts: {e}"
+                    )
+                    if not self._is_channel_active():
+                        return False, "channel_gone"
+                    return False, "failed"
+
+        return False, "failed"
+
+    def _load_and_chunk_audio(self, audio_path: str, max_retries: int = DEFAULT_MAX_RETRIES) -> bool:
+        """
+        Load audio file (any format) and split into chunks in memory with retry logic.
 
         Uses ffmpeg to decode any audio format (MP3, WAV, OGG, etc.) to raw PCM.
+        Retries on ANY error - transient issues are common in concurrent voice systems.
 
         Args:
             audio_path: Path to the audio file (any format supported by ffmpeg)
+            max_retries: Maximum retry attempts
 
         Returns:
-            True if successful, False otherwise
+            True if successful, False only after all retries exhausted
         """
-        try:
-            # Use ffmpeg to decode any audio format to raw 16-bit PCM
-            # Output: 8kHz mono (SIP standard) for consistent chunk timing
-            result = subprocess.run([
-                'ffmpeg', '-i', audio_path,
-                '-f', 's16le',           # Raw 16-bit signed little-endian PCM
-                '-acodec', 'pcm_s16le',
-                '-ar', '8000',           # 8kHz sample rate (SIP standard)
-                '-ac', '1',              # Mono
-                '-v', 'error',           # Suppress info output
-                '-'                      # Output to stdout
-            ], capture_output=True, timeout=30)
+        last_error = None
 
-            if result.returncode != 0:
-                self.logger.error(f"[CHUNKED] ffmpeg conversion failed: {result.stderr.decode()}")
-                return False
+        for attempt in range(max_retries + 1):
+            try:
+                # Check file exists - retry if not (might be transient filesystem issue)
+                if not os.path.exists(audio_path):
+                    last_error = f"Audio file not found: {audio_path}"
+                    if attempt < max_retries:
+                        self.logger.warning(
+                            f"[CHUNKED] {last_error} (attempt {attempt + 1}/{max_retries + 1}). Retrying..."
+                        )
+                        time.sleep(EBADF_RETRY_DELAY)
+                        continue
+                    self.logger.error(f"[CHUNKED] {last_error} after {max_retries + 1} attempts")
+                    return False
 
-            audio_data = result.stdout
-            sample_rate = 8000  # We requested 8kHz from ffmpeg
-            self._sample_rate = sample_rate
+                # Try to open and read file - retry on any error
+                try:
+                    with open(audio_path, 'rb') as f:
+                        f.read(4)  # Verify file is accessible
+                except Exception as e:
+                    last_error = f"File access check failed: {e}"
+                    if attempt < max_retries:
+                        self.logger.warning(
+                            f"[CHUNKED] {last_error} (attempt {attempt + 1}/{max_retries + 1}). Retrying..."
+                        )
+                        time.sleep(EBADF_RETRY_DELAY)
+                        continue
+                    raise
 
-            # Convert raw bytes to 16-bit samples
-            n_samples = len(audio_data) // 2
-            if n_samples == 0:
-                self.logger.error(f"[CHUNKED] No audio data from ffmpeg for {audio_path}")
-                return False
+                # Use ffmpeg to decode audio - retry on any error including timeout
+                try:
+                    result = subprocess.run([
+                        'ffmpeg', '-i', audio_path,
+                        '-f', 's16le',           # Raw 16-bit signed little-endian PCM
+                        '-acodec', 'pcm_s16le',
+                        '-ar', '8000',           # 8kHz sample rate (SIP standard)
+                        '-ac', '1',              # Mono
+                        '-v', 'error',           # Suppress info output
+                        '-'                      # Output to stdout
+                    ], capture_output=True, timeout=30)
+                except subprocess.TimeoutExpired as e:
+                    last_error = f"ffmpeg timeout: {e}"
+                    if attempt < max_retries:
+                        self.logger.warning(
+                            f"[CHUNKED] {last_error} (attempt {attempt + 1}/{max_retries + 1}). Retrying..."
+                        )
+                        time.sleep(EBADF_RETRY_DELAY)
+                        continue
+                    self.logger.error(f"[CHUNKED] ffmpeg timeout after {max_retries + 1} attempts")
+                    return False
 
-            samples = list(struct.unpack(f'<{n_samples}h', audio_data))
+                # Check ffmpeg result - retry on any non-zero return
+                if result.returncode != 0:
+                    error_msg = result.stderr.decode() if result.stderr else "Unknown error"
+                    last_error = f"ffmpeg failed: {error_msg}"
+                    if attempt < max_retries:
+                        self.logger.warning(
+                            f"[CHUNKED] {last_error} (attempt {attempt + 1}/{max_retries + 1}). Retrying..."
+                        )
+                        time.sleep(EBADF_RETRY_DELAY)
+                        continue
+                    self.logger.error(f"[CHUNKED] ffmpeg failed after {max_retries + 1} attempts: {error_msg}")
+                    return False
 
-            # Calculate chunk size based on sample rate
-            samples_per_chunk = int(sample_rate * self.chunk_duration_ms / 1000)
+                audio_data = result.stdout
+                sample_rate = 8000
+                self._sample_rate = sample_rate
 
-            # Split into chunks
-            self._chunks = []
-            total_samples = len(samples)
-            chunk_index = 0
-            start_sample = 0
+                # Check for empty audio - retry (might be transient)
+                n_samples = len(audio_data) // 2
+                if n_samples == 0:
+                    last_error = f"No audio data from ffmpeg for {audio_path}"
+                    if attempt < max_retries:
+                        self.logger.warning(
+                            f"[CHUNKED] {last_error} (attempt {attempt + 1}/{max_retries + 1}). Retrying..."
+                        )
+                        time.sleep(EBADF_RETRY_DELAY)
+                        continue
+                    self.logger.error(f"[CHUNKED] {last_error} after {max_retries + 1} attempts")
+                    return False
 
-            while start_sample < total_samples:
-                end_sample = min(start_sample + samples_per_chunk, total_samples)
-                chunk_samples = samples[start_sample:end_sample]
+                samples = list(struct.unpack(f'<{n_samples}h', audio_data))
 
-                duration_ms = (len(chunk_samples) / sample_rate) * 1000
+                # Calculate chunk size based on sample rate
+                samples_per_chunk = int(sample_rate * self.chunk_duration_ms / 1000)
 
-                self._chunks.append(AudioChunk(
-                    index=chunk_index,
-                    samples=chunk_samples,
-                    start_sample=start_sample,
-                    end_sample=end_sample,
-                    duration_ms=duration_ms
-                ))
+                # Split into chunks
+                self._chunks = []
+                total_samples = len(samples)
+                chunk_index = 0
+                start_sample = 0
 
-                start_sample = end_sample
-                chunk_index += 1
+                while start_sample < total_samples:
+                    end_sample = min(start_sample + samples_per_chunk, total_samples)
+                    chunk_samples = samples[start_sample:end_sample]
 
-            self._current_file = audio_path
+                    duration_ms = (len(chunk_samples) / sample_rate) * 1000
 
-            self.logger.debug(
-                f"[CHUNKED] Loaded {audio_path}: {len(self._chunks)} chunks "
-                f"({self.chunk_duration_ms}ms each, {total_samples / sample_rate:.2f}s total)"
-            )
+                    self._chunks.append(AudioChunk(
+                        index=chunk_index,
+                        samples=chunk_samples,
+                        start_sample=start_sample,
+                        end_sample=end_sample,
+                        duration_ms=duration_ms
+                    ))
 
-            return True
+                    start_sample = end_sample
+                    chunk_index += 1
 
-        except subprocess.TimeoutExpired:
-            self.logger.error(f"[CHUNKED] ffmpeg timeout loading {audio_path}")
-            return False
-        except Exception as e:
-            self.logger.error(f"[CHUNKED] Failed to load audio {audio_path}: {e}", exc_info=True)
-            return False
+                self._current_file = audio_path
 
-    def _write_temp_wav(self, samples: List[int]) -> Optional[str]:
+                if attempt > 0:
+                    self.logger.info(f"[CHUNKED] _load_and_chunk_audio succeeded on retry {attempt}")
+
+                self.logger.debug(
+                    f"[CHUNKED] Loaded {audio_path}: {len(self._chunks)} chunks "
+                    f"({self.chunk_duration_ms}ms each, {total_samples / sample_rate:.2f}s total)"
+                )
+
+                return True
+
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries:
+                    self.logger.warning(
+                        f"[CHUNKED] _load_and_chunk_audio failed (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying..."
+                    )
+                    time.sleep(EBADF_RETRY_DELAY)
+                else:
+                    self.logger.error(
+                        f"[CHUNKED] _load_and_chunk_audio failed after {max_retries + 1} attempts: {e}",
+                        exc_info=True
+                    )
+                    return False
+
+        return False
+
+    def _write_temp_wav(self, samples: List[int], max_retries: int = DEFAULT_MAX_RETRIES) -> Optional[str]:
         """
-        Write samples to a temporary WAV file for playback.
+        Write samples to a temporary WAV file for playback with retry logic.
+
+        Uses in-memory buffer to avoid fd race condition with concurrent
+        tempfile usage (e.g., CT transcription). Includes retry mechanism
+        for transient file descriptor errors.
 
         Args:
             samples: 16-bit PCM samples
+            max_retries: Maximum retry attempts for transient errors
 
         Returns:
             Path to temp file, or None on failure
         """
-        try:
-            # Create temp file
-            fd, temp_path = tempfile.mkstemp(suffix='.wav', prefix='chunk_')
-            os.close(fd)  # Close the file descriptor, we'll use wave module
+        import io
+        last_error = None
 
-            with wave.open(temp_path, 'wb') as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(2)  # 16-bit
-                wav.setframerate(self._sample_rate)
-                wav.writeframes(struct.pack(f'<{len(samples)}h', *samples))
+        for attempt in range(max_retries + 1):
+            temp_path = None
+            try:
+                # Create WAV in memory first (avoids fd race condition)
+                wav_buffer = io.BytesIO()
+                with wave.open(wav_buffer, 'wb') as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)  # 16-bit
+                    wav.setframerate(self._sample_rate)
+                    wav.writeframes(struct.pack(f'<{len(samples)}h', *samples))
 
-            # Make readable by FreeSWITCH (runs as freeswitch user, not root)
-            os.chmod(temp_path, 0o644)
+                # Get the buffer value before creating temp file
+                wav_data = wav_buffer.getvalue()
 
-            # Track for cleanup
-            with self._temp_lock:
-                self._temp_files.append(temp_path)
+                # Write to temp file atomically using NamedTemporaryFile
+                # Use a unique prefix with attempt number for debugging
+                prefix = f'chunk_{attempt}_' if attempt > 0 else 'chunk_'
+                with tempfile.NamedTemporaryFile(
+                    suffix='.wav', prefix=prefix, delete=False, mode='wb'
+                ) as tmp:
+                    tmp.write(wav_data)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())  # Force write to disk
+                    temp_path = tmp.name
 
-            return temp_path
+                # Brief delay for filesystem sync (helps prevent EBADF)
+                time.sleep(0.01)
 
-        except Exception as e:
-            self.logger.error(f"[CHUNKED] Failed to write temp WAV: {e}")
-            return None
+                # Make readable by FreeSWITCH (runs as freeswitch user, not root)
+                os.chmod(temp_path, 0o644)
+
+                # Verify file was written correctly
+                if not os.path.exists(temp_path):
+                    raise OSError(errno.ENOENT, f"Temp file not found after write: {temp_path}")
+
+                file_size = os.path.getsize(temp_path)
+                expected_size = len(wav_data)
+                if file_size != expected_size:
+                    raise OSError(errno.EIO, f"Temp file size mismatch: {file_size} != {expected_size}")
+
+                # Track for cleanup
+                with self._temp_lock:
+                    self._temp_files.append(temp_path)
+
+                if attempt > 0:
+                    self.logger.info(f"[CHUNKED] _write_temp_wav succeeded on retry {attempt}")
+
+                return temp_path
+
+            except Exception as e:
+                last_error = e
+
+                # Clean up failed temp file if it was created
+                if temp_path and os.path.exists(temp_path):
+                    try:
+                        os.unlink(temp_path)
+                    except Exception:
+                        pass
+
+                # Retry ALL errors
+                if attempt < max_retries:
+                    self.logger.warning(
+                        f"[CHUNKED] _write_temp_wav failed (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying..."
+                    )
+                    time.sleep(EBADF_RETRY_DELAY)
+                else:
+                    self.logger.error(
+                        f"[CHUNKED] _write_temp_wav failed after {max_retries + 1} attempts: {e}"
+                    )
+                    return None
+
+        return None
 
     def _cleanup_temp_file(self, temp_path: str):
         """Clean up a temporary file"""
@@ -505,11 +795,12 @@ class ChunkedPlaybackController:
                     # ESL is NOT thread-safe (background threads cause segfaults)
                     # Longer intervals = fewer commands = less timing corruption
                     while True:
-                        try:
-                            self.conn.execute("sleep", "300")
-                        except Exception as e:
-                            self.logger.warning(f"[CHUNKED] Keepalive failed: {e}")
-                            time.sleep(0.3)
+                        # Use retry-enabled method for handling transient fd errors
+                        if not self._execute_sleep_with_retry(300):
+                            # Sleep returned False - channel gone
+                            if not self._is_channel_active():
+                                self.logger.warning("[CHUNKED] Channel gone during pause (sleep failed)")
+                                return ChunkedPlaybackResult.CHANNEL_GONE
 
                         # Check hard timeout - resume even if caller still speaking
                         pause_elapsed = time.time() - pause_start_time
@@ -624,16 +915,22 @@ class ChunkedPlaybackController:
                 self.logger.warning("[CHUNKED] Channel gone - stopping playback")
                 return ChunkedPlaybackResult.CHANNEL_GONE
 
-            # Write chunk to temp file
+            # Write chunk to temp file (with retry logic)
             temp_path = self._write_temp_wav(chunk.samples)
             if temp_path is None:
-                self.logger.error(f"[CHUNKED] Failed to create temp file for chunk {i}")
+                self.logger.error(f"[CHUNKED] Failed to create temp file for chunk {i} after retries")
                 return ChunkedPlaybackResult.FAILED
 
             try:
-                # Play this chunk (BLOCKING)
-                self.logger.debug(f"[CHUNKED] Playing chunk {i + 1}/{total_chunks} ({chunk.duration_ms:.0f}ms)")
-                self.conn.execute("playback", temp_path)
+                # Play this chunk with retry logic for transient fd errors
+                success, error_type = self._play_chunk_with_retry(temp_path, i, total_chunks)
+
+                if not success:
+                    if error_type == "channel_gone":
+                        return ChunkedPlaybackResult.CHANNEL_GONE
+                    else:
+                        # Playback failed even after retries
+                        return ChunkedPlaybackResult.FAILED
 
             finally:
                 # Clean up temp file immediately after playback
