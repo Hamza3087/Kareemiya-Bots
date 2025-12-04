@@ -19,6 +19,20 @@ from collections import deque
 # Import Silero VAD singleton for speech detection
 from src.silero_vad_singleton import SileroVADSingleton
 
+# Import SNR calculator and noise filtering
+from src.snr_calculator import SNRCalculator
+from src.silero_denoise_singleton import SileroDenoiseSingleton, NoiseReduceFilter
+
+# Import audio processing config from src/config.py
+from src.config import (
+    NOISE_FILTER_METHOD,
+    ENABLE_NOISE_FILTERING,
+    SNR_THRESHOLD,
+    AGGRESSIVE_SNR_THRESHOLD,
+    NOISE_FLOOR_ALPHA,
+    MIN_NOISE_FLOOR
+)
+
 
 class ContinuousTranscriptionHandler:
     """
@@ -50,6 +64,50 @@ class ContinuousTranscriptionHandler:
         # Store threshold for use in inference calls
         self.silero_vad_singleton = SileroVADSingleton()
         self.logger.info(f"Silero VAD singleton ready for continuous transcription (threshold={energy_threshold})")
+
+        # SNR and noise filtering configuration (from config file)
+        self.enable_noise_filtering = ENABLE_NOISE_FILTERING
+        self.noise_filter_method = NOISE_FILTER_METHOD  # "silero", "noisereduce", or "none"
+        self.snr_threshold = SNR_THRESHOLD
+        self.aggressive_snr_threshold = AGGRESSIVE_SNR_THRESHOLD
+
+        # Track filtering state for logging transitions
+        self._last_filter_state = "none"  # "none", "mild", "aggressive"
+
+        # Initialize SNR calculator with config values
+        self.snr_calculator = SNRCalculator(
+            sample_rate=8000,
+            noise_floor_alpha=NOISE_FLOOR_ALPHA,
+            min_noise_floor=MIN_NOISE_FLOOR,
+            logger=logger
+        )
+        self.last_snr_db = 0.0
+
+        # Initialize noise filter based on config (no fallback)
+        self.silero_denoiser = None
+        self.noisereduce_filter = None
+
+        if self.enable_noise_filtering and self.noise_filter_method != "none":
+            if self.noise_filter_method == "silero":
+                self.silero_denoiser = SileroDenoiseSingleton()
+                silero_model = self.silero_denoiser.get_model(logger)
+                if silero_model:
+                    self.logger.info(f"Noise filter: Silero Denoise loaded (method={self.noise_filter_method})")
+                else:
+                    self.logger.error("Noise filter: Silero Denoise FAILED to load - filtering disabled")
+                    self.enable_noise_filtering = False
+            elif self.noise_filter_method == "noisereduce":
+                self.noisereduce_filter = NoiseReduceFilter(sample_rate=8000, logger=logger)
+                if self.noisereduce_filter.is_available():
+                    self.logger.info(f"Noise filter: noisereduce loaded (method={self.noise_filter_method})")
+                else:
+                    self.logger.error("Noise filter: noisereduce NOT available - filtering disabled")
+                    self.enable_noise_filtering = False
+            else:
+                self.logger.error(f"Noise filter: unknown method '{self.noise_filter_method}' - filtering disabled")
+                self.enable_noise_filtering = False
+        else:
+            self.logger.info(f"Noise filtering disabled (enable={self.enable_noise_filtering}, method={self.noise_filter_method})")
 
         # Speech-silence pattern detection (from old continuous_listener.py)
         self.min_speech_duration = 0.08  # 80ms minimum speech
@@ -183,11 +241,49 @@ class ContinuousTranscriptionHandler:
 
     def add_audio_chunk(self, audio_bytes: bytes):
         """
-        Add audio chunk to buffer and update speech detection state
+        VAD-gated noise filtering pipeline.
+
+        Filter is applied ONLY to audio chunks that VAD approves as speech.
+        Non-speech chunks pass through unchanged (they're silence/noise we'll discard anyway).
 
         Args:
             audio_bytes: Raw audio bytes (8kHz, 16-bit mono PCM)
         """
+        # Step 1: VAD FIRST - detect speech before any filtering decision
+        is_speech = self._update_speech_state(audio_bytes)
+
+        # Step 2: Apply noise filtering ONLY if VAD detected speech
+        if is_speech and self.enable_noise_filtering:
+            # Calculate SNR for filter intensity decision (only when speech detected)
+            snr_db, signal_rms = self.snr_calculator.calculate_snr(audio_bytes)
+            self.last_snr_db = snr_db
+
+            # Determine filter intensity based on SNR
+            if snr_db >= self.snr_threshold:
+                filter_mode = "none"  # Clean speech, no filter needed
+            elif snr_db < self.aggressive_snr_threshold:
+                filter_mode = "aggressive"
+            else:
+                filter_mode = "mild"
+
+            # Always log SNR when speech detected (for visibility)
+            noise_level = self.snr_calculator.get_noise_level(snr_db)
+            if filter_mode == "none":
+                self.logger.info(f"🔊 VAD=speech, SNR={snr_db:.1f}dB ({noise_level}) - no filtering needed")
+            else:
+                self.logger.info(f"🔊 VAD=speech, SNR={snr_db:.1f}dB ({noise_level}) - filter {filter_mode.upper()} ({self.noise_filter_method})")
+            self._last_filter_state = filter_mode
+
+            # Apply filter if needed
+            if filter_mode != "none":
+                audio_bytes = self._apply_noise_filtering(audio_bytes, snr_db)
+        else:
+            # Not speech - log transition to "off" state
+            if self._last_filter_state != "none":
+                self.logger.info(f"🔇 VAD=no_speech - filter OFF")
+                self._last_filter_state = "none"
+
+        # Step 3: Buffer management (unchanged)
         with self.buffer_lock:
             self.audio_buffer.extend(audio_bytes)
             self.stats['chunks_processed'] += 1
@@ -201,10 +297,9 @@ class ContinuousTranscriptionHandler:
                 # Keep only the most recent audio
                 self.audio_buffer = bytearray(self.audio_buffer[-max_bytes:])
 
-        # Mark that audio activity occurred (for DAIR 2 detection)
+        # Step 4: Audio activity detection (for DAIR 2 detection)
         # Check for actual audio energy, not just non-empty bytes
         if len(audio_bytes) > 0 and not self.audio_activity_detected:
-            import numpy as np
             audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
             rms = np.sqrt(np.mean(audio_array.astype(float)**2))
 
@@ -213,9 +308,6 @@ class ContinuousTranscriptionHandler:
             if rms > 50:
                 self.logger.info(f"Audio activity detected (RMS={rms:.1f}) - will use DAIR 2 disposition if max silences reached")
                 self.audio_activity_detected = True
-
-        # Update speech detection state using Silero VAD
-        self._update_speech_state(audio_bytes)
 
     def should_transcribe(self) -> bool:
         """
@@ -360,13 +452,16 @@ class ContinuousTranscriptionHandler:
                 except Exception as e:
                     self.logger.error(f"Error in immediate transcription: {e}", exc_info=True)
 
-    def _update_speech_state(self, audio_bytes: bytes):
+    def _update_speech_state(self, audio_bytes: bytes) -> bool:
         """
-        Update speech detection state using Silero VAD
-        Implements speech-silence pattern detection from old continuous_listener.py
+        Update speech detection state using Silero VAD.
+        Implements speech-silence pattern detection from old continuous_listener.py.
 
         Args:
             audio_bytes: Raw audio bytes (8kHz, 16-bit mono PCM)
+
+        Returns:
+            is_speech: True if VAD detected speech in this chunk
         """
         try:
             # Use Silero VAD singleton to detect speech
@@ -445,8 +540,64 @@ class ContinuousTranscriptionHandler:
                 except Exception as e:
                     self.logger.error(f"Error in speech_end callback: {e}")
 
+            return is_speech
+
         except Exception as e:
             self.logger.error(f"Error updating speech state: {e}", exc_info=True)
+            return False  # Safe default on error
+
+    def _apply_noise_filtering(self, audio_bytes: bytes, snr_db: float) -> bytes:
+        """
+        Apply SNR-based adaptive noise filtering using configured method.
+
+        Uses ONLY the method specified in config (no fallback).
+        Applies more aggressive filtering for very noisy audio (SNR < aggressive_threshold).
+
+        Args:
+            audio_bytes: Raw 16-bit PCM audio bytes
+            snr_db: Current SNR in dB
+
+        Returns:
+            Filtered audio bytes (or original if filtering unavailable/fails)
+        """
+        try:
+            aggressive = snr_db < self.aggressive_snr_threshold
+
+            # Use configured filter method (no fallback)
+            if self.noise_filter_method == "silero" and self.silero_denoiser:
+                return self.silero_denoiser.denoise_audio(
+                    audio_bytes,
+                    snr_db=snr_db,
+                    snr_threshold=self.snr_threshold,
+                    aggressive_threshold=self.aggressive_snr_threshold,
+                    sample_rate=8000
+                )
+            elif self.noise_filter_method == "noisereduce" and self.noisereduce_filter:
+                return self.noisereduce_filter.filter_audio(
+                    audio_bytes,
+                    snr_db=snr_db,
+                    snr_threshold=self.snr_threshold,
+                    aggressive=aggressive
+                )
+
+            # No filter configured or available
+            return audio_bytes
+
+        except Exception as e:
+            self.logger.error(f"Noise filtering error: {e}", exc_info=True)
+            return audio_bytes
+
+    def get_snr_stats(self) -> dict:
+        """Get SNR statistics."""
+        return {
+            'last_snr_db': self.last_snr_db,
+            'noise_level': self.snr_calculator.get_noise_level(self.last_snr_db),
+            'snr_calculator_stats': self.snr_calculator.get_stats(),
+            'noise_filter_method': self.noise_filter_method,
+            'noise_filter_enabled': self.enable_noise_filtering,
+            'silero_denoise_loaded': self.silero_denoiser.is_loaded() if self.silero_denoiser else False,
+            'noisereduce_available': self.noisereduce_filter.is_available() if self.noisereduce_filter else False
+        }
 
     def _transcribe_audio_chunk(self, audio_bytes: bytes) -> Tuple[Optional[str], float]:
         """

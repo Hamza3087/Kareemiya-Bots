@@ -41,6 +41,18 @@ from src.esl_config_reader import ESLConfigReader
 # Import Silero VAD singleton for speech detection
 from src.silero_vad_singleton import SileroVADSingleton
 
+# Import SNR calculator and noise filtering for main response
+from src.snr_calculator import SNRCalculator
+from src.silero_denoise_singleton import SileroDenoiseSingleton
+from src.config import (
+    NOISE_FILTER_METHOD,
+    ENABLE_NOISE_FILTERING,
+    SNR_THRESHOLD,
+    AGGRESSIVE_SNR_THRESHOLD,
+    NOISE_FLOOR_ALPHA,
+    MIN_NOISE_FLOOR
+)
+
 # Ringing detection components (framework-agnostic)
 from src.ringing_detector_core import (
     GoertzelDetector,
@@ -1171,6 +1183,34 @@ File Path: {file_path}
             # Fallback: return original bytes (better than crashing)
             return stereo_bytes
 
+    def _apply_main_response_noise_filter(self, audio_bytes: bytes, snr_db: float) -> bytes:
+        """
+        Apply noise filtering to main response audio if SNR is below threshold.
+
+        Args:
+            audio_bytes: Raw 16-bit PCM audio bytes (8kHz mono)
+            snr_db: Current SNR in dB
+
+        Returns:
+            Filtered audio bytes (or original if filtering disabled/unavailable)
+        """
+        if not self.enable_noise_filtering:
+            return audio_bytes
+
+        try:
+            if self.noise_filter_method == "silero" and self.silero_denoiser:
+                return self.silero_denoiser.denoise_audio(
+                    audio_bytes,
+                    snr_db=snr_db,
+                    snr_threshold=self.snr_threshold,
+                    aggressive_threshold=self.aggressive_snr_threshold,
+                    sample_rate=8000
+                )
+        except Exception as e:
+            self._log_and_collect('error', f"Main response noise filtering error: {e}")
+
+        return audio_bytes
+
     def _stop_audio_detection(self):
         """Stop unified audio detection (ringing + voicemail) and cleanup"""
         try:
@@ -1289,6 +1329,24 @@ File Path: {file_path}
             # (preloaded by bot_server at startup, zero per-call overhead)
             self.silero_vad_singleton = SileroVADSingleton()
             self._log_and_collect('info', "Silero VAD singleton ready for response transcription")
+
+            # SNR calculator and noise filtering for main response listener
+            self.snr_calculator = SNRCalculator(
+                sample_rate=8000,
+                noise_floor_alpha=NOISE_FLOOR_ALPHA,
+                min_noise_floor=MIN_NOISE_FLOOR,
+                logger=self.logger
+            )
+            self.enable_noise_filtering = ENABLE_NOISE_FILTERING
+            self.noise_filter_method = NOISE_FILTER_METHOD
+            self.snr_threshold = SNR_THRESHOLD
+            self.aggressive_snr_threshold = AGGRESSIVE_SNR_THRESHOLD
+
+            # Initialize noise filter (reuse singleton from continuous transcription)
+            self.silero_denoiser = None
+            if self.enable_noise_filtering and self.noise_filter_method == "silero":
+                self.silero_denoiser = SileroDenoiseSingleton()
+                self._log_and_collect('info', f"Main response noise filter: {self.noise_filter_method}")
 
             # Qwen intent detector (singleton - accesses same instance preloaded by bot_server)
             if QwenModelSingleton:
@@ -2173,8 +2231,20 @@ File Path: {file_path}
 
                             # Accumulate ONLY VAD-confirmed speech chunks for Parakeet transcription
                             if is_speech:
-                                # Speech chunk - add to speech buffer
-                                speech_only_audio.extend(new_audio)
+                                # Calculate SNR and apply noise filtering if needed
+                                audio_to_accumulate = new_audio
+                                if self.enable_noise_filtering:
+                                    snr_db, _ = self.snr_calculator.calculate_snr(new_audio)
+                                    noise_level = self.snr_calculator.get_noise_level(snr_db)
+                                    if snr_db < self.snr_threshold:
+                                        filter_mode = "AGGRESSIVE" if snr_db < self.aggressive_snr_threshold else "MILD"
+                                        self._log_and_collect('info', f"🔊 [MAIN] SNR={snr_db:.1f}dB ({noise_level}) - filter {filter_mode}")
+                                        audio_to_accumulate = self._apply_main_response_noise_filter(new_audio, snr_db)
+                                    else:
+                                        self._log_and_collect('info', f"🔊 [MAIN] SNR={snr_db:.1f}dB ({noise_level}) - no filtering needed")
+
+                                # Speech chunk - add to speech buffer (filtered if noisy)
+                                speech_only_audio.extend(audio_to_accumulate)
                                 speech_chunk_count += 1
 
                                 # Track actual speech duration from chunk size

@@ -286,4 +286,31 @@ POLLING_FALLBACK_INTERVAL = 0.5  # 500ms
 
 # Continuous listener overlap buffer in seconds (prevents missing audio at chunk boundaries)
 CONTINUOUS_LISTENER_OVERLAP_SECONDS = 1.0  # 1 second overlap
+
+# -----------------------------
+# SNR & Noise Filtering Configuration
+# -----------------------------
+# Noise filter method: "silero", "noisereduce", or "none"
+# - "silero": Silero Denoise neural network (~50MB, ~20ms/sec audio, better quality)
+# - "noisereduce": Spectral gating (pure Python, ~5-10ms/sec, 8kHz native)
+# - "none": Disable noise filtering (SNR calculation only)
+NOISE_FILTER_METHOD = "silero"
+
+# Master switch for noise filtering
+ENABLE_NOISE_FILTERING = True
+
+# SNR threshold (dB) below which filtering is applied
+# Audio with SNR >= this passes through unchanged
+SNR_THRESHOLD = 15.0
+
+# SNR threshold (dB) for aggressive filtering
+# Audio with SNR < this gets stronger noise reduction
+AGGRESSIVE_SNR_THRESHOLD = 10.0
+
+# Adaptive noise floor smoothing (0.0-1.0)
+# Lower = stable/slow, Higher = fast/jittery
+NOISE_FLOOR_ALPHA = 0.1
+
+# Minimum noise floor to prevent division by zero
+MIN_NOISE_FLOOR = 1.0
 # -----------------------------
