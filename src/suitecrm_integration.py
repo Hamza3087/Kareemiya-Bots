@@ -32,7 +32,7 @@ class SuiteCRMAgentConfig:
                  background_noise_volume: float, max_silence_retries: int, max_clarification_retries: int,
                  did_transfer_qualified: str, did_transfer_hangup: str, honey_pot_sentences: List[str],
                  energy_threshold: str = None, rnnt_confidence_threshold: str = None, white_list_command: str = None,
-                 script_id: str = None):
+                 script_id: str = None, interrupt_detection: bool = True):
         self.agent_id = agent_id
         self.agent_name = agent_name
         self.voice_location = voice_location
@@ -67,6 +67,10 @@ class SuiteCRMAgentConfig:
             self.rnnt_confidence_threshold = 0.5
 
         self.noise_volume = self.background_noise_volume
+
+        # Interrupt detection setting (from e_campaigns.interrupt_detection)
+        # 1 = enabled, 0 = disabled. Default to True if not specified.
+        self.interrupt_detection = bool(interrupt_detection) if interrupt_detection is not None else True
 
 class SuiteCRMDBManager:
     """Production-grade database manager with connection pooling"""
@@ -421,7 +425,8 @@ def fetch_active_agent_configs() -> List[SuiteCRMAgentConfig]:
             camp.honey_pot_sentences,
             camp.energy_threshold,
             camp.rnnt_confidence_threshold,
-            camp.white_list_command
+            camp.white_list_command,
+            camp.interrupt_detection
         FROM e_campaigns_e_agent_c camp_rel
         JOIN e_campaigns camp ON camp_rel.e_campaigns_e_agente_campaigns_ida = camp.id AND camp.deleted = 0
         WHERE camp_rel.deleted = 0
@@ -480,7 +485,8 @@ def fetch_active_agent_configs() -> List[SuiteCRMAgentConfig]:
                     energy_threshold=row.get('energy_threshold'),
                     rnnt_confidence_threshold=row.get('rnnt_confidence_threshold'),
                     white_list_command=row.get('white_list_command'),
-                    script_id=row.get('script_id')
+                    script_id=row.get('script_id'),
+                    interrupt_detection=row.get('interrupt_detection', 1)  # Default to enabled
                 )
                 
                 configs.append(config)
@@ -499,7 +505,17 @@ def fetch_active_agent_configs() -> List[SuiteCRMAgentConfig]:
             print(f"🍯 Campaign {campaign_id} loaded {len(phrases)} honeypot phrases: {phrases}")
         else:
             print(f"🍯 Campaign {campaign_id} has no honeypot phrases")
-    
+
+    # Log interrupt detection settings per campaign
+    campaign_interrupt = {}
+    for config in configs:
+        if config.vicidial_campaign_id not in campaign_interrupt:
+            campaign_interrupt[config.vicidial_campaign_id] = config.interrupt_detection
+
+    for campaign_id, interrupt_enabled in campaign_interrupt.items():
+        status = "enabled" if interrupt_enabled else "disabled"
+        print(f"🎤 Campaign {campaign_id} interrupt detection: {status}")
+
     print(f"✅ Loaded {len(configs)} active agent configurations")
     return configs
 

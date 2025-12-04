@@ -89,7 +89,9 @@ class ChunkedPlaybackController:
         auto_resume_on_silence: bool = False,
         silence_threshold: float = 5.0,
         pause_silence_threshold: float = 0.7,
-        on_pause_intent_check: Optional[Callable[[str], Tuple[Optional[str], Optional[str]]]] = None
+        on_pause_intent_check: Optional[Callable[[str], Tuple[Optional[str], Optional[str]]]] = None,
+        on_interrupt_resume: Optional[Callable[[], bool]] = None,
+        interrupt_hard_timeout: float = 5.0
     ):
         """
         Initialize the playback controller.
@@ -105,6 +107,10 @@ class ChunkedPlaybackController:
             silence_threshold: Seconds of silence before auto-resuming (default 5.0)
             pause_silence_threshold: Seconds of silence to trigger intent check during pause (default 0.7)
             on_pause_intent_check: Optional callback(transcription_text) -> (intent, transcription) for pause intent detection
+            on_interrupt_resume: Optional callback() -> bool called when resuming after neutral intent.
+                                 Returns True to allow resume, False to skip interrupt detection for rest of call.
+            interrupt_hard_timeout: Max seconds to wait during interrupt pause before resuming (default 5.0).
+                                    Resumes playback even if caller is still speaking.
         """
         self.conn = conn
         self.uuid = uuid
@@ -120,6 +126,13 @@ class ChunkedPlaybackController:
         # Pause intent detection configuration
         self.pause_silence_threshold = pause_silence_threshold
         self.on_pause_intent_check = on_pause_intent_check
+
+        # Interrupt resume callback - called when resuming after neutral intent
+        # Returns True to allow resume, False to disable future interrupts
+        self.on_interrupt_resume = on_interrupt_resume
+
+        # Hard timeout for interrupt pause - resumes playback even if caller still speaking
+        self.interrupt_hard_timeout = interrupt_hard_timeout
 
         # Calculate samples per chunk
         self.samples_per_chunk = int(self.SAMPLE_RATE * chunk_duration_ms / 1000)
@@ -148,12 +161,20 @@ class ChunkedPlaybackController:
         self._barge_in_detected = threading.Event()
         self._callbacks_set = False
 
+        # Track if interrupts were permanently disabled (retries exhausted)
+        # This persists across multiple play_audio() calls on same controller
+        self._interrupts_permanently_disabled = False
+
         # Temp file tracking for cleanup
         self._temp_files: List[str] = []
         self._temp_lock = threading.Lock()
 
     def _setup_speech_callbacks(self):
         """Set up speech detection callbacks for auto pause/resume"""
+        # Skip if interrupts were permanently disabled (retries exhausted)
+        if self._interrupts_permanently_disabled:
+            self.logger.debug("[CHUNKED] Interrupts permanently disabled - skipping callback setup")
+            return
         if self.ct and not self._callbacks_set:
             try:
                 self.ct.set_speech_callbacks(
@@ -480,14 +501,22 @@ class ChunkedPlaybackController:
                     speech_detected = True
                     silence_start = None
 
+                    # Use 300ms FS sleep intervals on main thread
+                    # ESL is NOT thread-safe (background threads cause segfaults)
+                    # Longer intervals = fewer commands = less timing corruption
                     while True:
-                        # Use FreeSWITCH sleep as PRIMARY wait - this maintains RTP flow!
-                        # Python time.sleep() does NOT maintain RTP and causes choppy audio on resume
                         try:
-                            self.conn.execute("sleep", "100")  # 100ms intervals for responsive silence detection
+                            self.conn.execute("sleep", "300")
                         except Exception as e:
                             self.logger.warning(f"[CHUNKED] Keepalive failed: {e}")
-                            time.sleep(0.1)  # Fallback only on error
+                            time.sleep(0.3)
+
+                        # Check hard timeout - resume even if caller still speaking
+                        pause_elapsed = time.time() - pause_start_time
+                        if pause_elapsed >= self.interrupt_hard_timeout:
+                            self.logger.warning(
+                                f"[CHUNKED] Interrupt hard timeout ({self.interrupt_hard_timeout}s) reached - resuming playback")
+                            break
 
                         # Check channel still active
                         if not self._is_channel_active():
@@ -516,6 +545,10 @@ class ChunkedPlaybackController:
                                 if silence_duration >= self.pause_silence_threshold:
                                     self.logger.info(f"[CHUNKED] {self.pause_silence_threshold}s silence detected - checking intent")
                                     break
+
+                    # Grace period: let RTP timer settle after sleep commands
+                    time.sleep(0.3)
+                    self.logger.debug("[CHUNKED] Pause loop exited with grace period")
 
                     # Get EXISTING transcriptions from CT (already transcribed during playback!)
                     # No need to re-transcribe - use what CT already captured
@@ -548,6 +581,17 @@ class ChunkedPlaybackController:
                                 else:
                                     # Neutral or no intent - resume playback
                                     self.logger.info(f"[CHUNKED] Neutral/no intent - resuming from chunk {i + 1}")
+                                    # Notify handler that an interrupt retry was used
+                                    if self.on_interrupt_resume:
+                                        try:
+                                            allow_future = self.on_interrupt_resume()
+                                            if not allow_future:
+                                                # Retries exhausted - disable speech callbacks permanently
+                                                self.logger.warning("[CHUNKED] Interrupt retries exhausted - disabling future interrupts")
+                                                self._interrupts_permanently_disabled = True
+                                                self._cleanup_speech_callbacks()
+                                        except Exception as e:
+                                            self.logger.error(f"[CHUNKED] on_interrupt_resume callback failed: {e}")
                             except Exception as e:
                                 self.logger.error(f"[CHUNKED] Intent check callback failed: {e}")
                                 # On error, default to resume

@@ -88,7 +88,7 @@ MIN_INTENT_CONFIDENCE = 0.65
 # -----------------------------
 SIP_PORT = 5060
 SIP_BIND_ADDRESS = "0.0.0.0"
-MAX_CALL_DURATION = 300  # 5 minutes max call duration
+MAX_CALL_DURATION = 120  # 2 minutes max call duration
 # -----------------------------
 # Audio Timing Settings
 # -----------------------------
@@ -209,6 +209,16 @@ RESPONSE_MIN_SPEECH_DURATION = 0.08  # 80ms minimum
 
 # Minimum audio length for processing (seconds)
 RESPONSE_MIN_AUDIO_LENGTH = 0.15  # 150ms minimum
+
+# -----------------------------
+# Interrupt Detection Configuration
+# -----------------------------
+# Max pause/resume cycles before disabling interrupt detection for the call
+MAX_INTERRUPT_RETRIES = 2
+
+# Max seconds to wait during interrupt pause before resuming playback
+# Even if caller is still speaking, resume after this timeout
+INTERRUPT_PAUSE_HARD_TIMEOUT = 5.0
 
 # -----------------------------
 # Voicemail Detection (VMD) Configuration

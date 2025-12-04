@@ -347,6 +347,13 @@ class FreeSWITCHBotHandler:
         # Main response listening flag (continuous transcription runs when this is False)
         self.main_response_listening = False
 
+        # Interrupt detection with retries
+        # Controlled by e_campaigns.interrupt_detection field (1=enabled, 0=disabled)
+        # After max retries (pause/resumes), interrupt detection is disabled for rest of call
+        self.interrupt_detection_enabled = agent_config.interrupt_detection
+        self.max_interrupt_retries = config.MAX_INTERRUPT_RETRIES
+        self.interrupt_retries_remaining = self.max_interrupt_retries if self.interrupt_detection_enabled else 0
+
         # Track if critical pitch was delivered (for NP vs DC disposition logic)
         self.pitch_delivered = False
 
@@ -517,6 +524,7 @@ File Path: {file_path}
         - CLBK: Callback requested
         - DAIR/DAIR 2: Did Answer Incomplete Response (silence)
         - DC: Disconnected (after progress)
+        - DC-timeout: Disconnected due to max call duration exceeded
         - NP: No Progress (early hangup)
         - SALE: Transferred/qualified
         """
@@ -544,6 +552,10 @@ File Path: {file_path}
 
         # Disconnected after progress
         elif disposition == 'DC':
+            return CallOutcome.HANGUP_SCRIPTED
+
+        # Disconnected due to max call duration timeout
+        elif disposition == 'DC-timeout':
             return CallOutcome.HANGUP_SCRIPTED
 
         # No progress (early hangup - from fallback_map)
@@ -1399,6 +1411,13 @@ File Path: {file_path}
                 )
                 self._log_and_collect('info', f"Continuous transcription handler initialized with immediate hangup (energy_threshold={self.agent_config.energy_threshold})")
 
+                # Log interrupt detection status
+                if self.interrupt_detection_enabled:
+                    self._log_and_collect('info',
+                        f"[INTERRUPT] Interrupt detection ENABLED with {self.max_interrupt_retries} retries")
+                else:
+                    self._log_and_collect('info', "[INTERRUPT] Interrupt detection DISABLED by campaign setting")
+
                 # Register continuous transcription for cleanup (prevents memory leak)
                 self.resource_manager.register(
                     'continuous_transcription',
@@ -1580,21 +1599,45 @@ File Path: {file_path}
         Auto pause/resume behavior:
         - When user speaks during playback, pause at next chunk boundary
         - After 5 seconds of silence, automatically resume playback
+        - Interrupt detection limited to 3 retries per call (if enabled)
         """
         if self.chunked_playback_controller is None:
             self.chunked_playback_controller = ChunkedPlaybackController(
                 conn=self.conn,
                 uuid=self.uuid,
-                continuous_transcription=self.continuous_transcription,
+                continuous_transcription=self.continuous_transcription if self.interrupt_detection_enabled else None,
                 logger=self.logger,
                 chunk_duration_ms=500,  # 500ms chunks = max pause latency
                 on_chunk_complete=self._on_chunk_complete,
                 auto_resume_on_silence=True,  # Enable auto-resume after user stops speaking
                 silence_threshold=5.0,  # Legacy: keep for backward compat
                 pause_silence_threshold=config.RESPONSE_SILENCE_TIMEOUT,  # 0.7s silence to trigger intent check
-                on_pause_intent_check=self._check_pause_intent  # Intent check callback during pause
+                on_pause_intent_check=self._check_pause_intent if self.interrupt_detection_enabled else None,
+                on_interrupt_resume=self._on_interrupt_resume if self.interrupt_detection_enabled else None,
+                interrupt_hard_timeout=config.INTERRUPT_PAUSE_HARD_TIMEOUT  # Max wait during interrupt pause
             )
         return self.chunked_playback_controller
+
+    def _on_interrupt_resume(self) -> bool:
+        """
+        Called when playback resumes after an interrupt (neutral intent detected).
+        Decrements the retry counter and returns whether future interrupts are allowed.
+
+        Returns:
+            True if more interrupts are allowed, False if retries exhausted
+        """
+        self.interrupt_retries_remaining -= 1
+
+        if self.interrupt_retries_remaining > 0:
+            self._log_and_collect('info',
+                f"[INTERRUPT] Used 1 interrupt retry. {self.interrupt_retries_remaining}/{self.max_interrupt_retries} remaining")
+            return True
+        else:
+            self._log_and_collect('warning',
+                f"[INTERRUPT] All {self.max_interrupt_retries} interrupt retries exhausted. "
+                f"Disabling interrupt detection for remainder of call.")
+            self.interrupt_detection_enabled = False
+            return False
 
     def _on_chunk_complete(self, chunk_index: int, total_chunks: int):
         """Callback after each chunk completes playback"""
@@ -2814,6 +2857,16 @@ File Path: {file_path}
 
         # Main conversation loop
         while self.current_step != 'exit' and self.is_active:
+            # Check max call duration
+            elapsed = time.time() - self.call_start_time
+            if elapsed >= config.MAX_CALL_DURATION:
+                self._log_and_collect('warning',
+                    f"[TIMEOUT] Max call duration ({config.MAX_CALL_DURATION}s) exceeded - hanging up")
+                self.call_data['disposition'] = 'DC-timeout'
+                self.call_data['call_result'] = 'max_duration_exceeded'
+                self.is_active = False
+                break
+
             # Get current step
             step = self.call_flow['steps'].get(self.current_step)
             if not step:
